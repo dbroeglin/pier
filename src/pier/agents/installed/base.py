@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 from pier.agents.base import BaseAgent
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.install import AgentInstallSpec
-from pier.utils.env import parse_bool_env_value
+from pier.utils.env import is_sensitive_env_key, parse_bool_env_value, redact_sensitive_value
 from pier.utils.templating import render_prompt_template
 
 
@@ -20,6 +20,14 @@ class NonZeroAgentExitCodeError(RuntimeError):
     """Raised when the agent process exits with a non-zero exit code."""
 
     pass
+
+
+def _redact_env_for_log(env: dict[str, str]) -> dict[str, str]:
+    """Return a copy of env with sensitive values replaced by redacted placeholders."""
+    return {
+        k: redact_sensitive_value(v) if is_sensitive_env_key(k) else v
+        for k, v in env.items()
+    }
 
 
 _F = Any  # Use Any to keep the decorator signature-transparent to type checkers
@@ -333,7 +341,7 @@ class BaseInstalledAgent(BaseAgent, ABC):
             f"Running command: {command}",
             extra={
                 "user": str(user),
-                "env": merged_env or {},
+                "env": _redact_env_for_log(merged_env) if merged_env else {},
             },
         )
 

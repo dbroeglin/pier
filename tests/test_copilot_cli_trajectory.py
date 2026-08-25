@@ -13,6 +13,8 @@ from pier.agents.installed.copilot_cli import (
     find_copilot_session_events,
 )
 from pier.models.agent.context import AgentContext
+from pier.models.trajectories.final_metrics import FinalMetrics
+from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "copilot_cli"
 
@@ -4191,3 +4193,132 @@ def test_copilot_cli_partial_token_details_are_not_discarded(tmp_path: Path):
     assert trajectory.final_metrics is not None
     assert trajectory.final_metrics.total_completion_tokens == 50
     assert trajectory.final_metrics.total_prompt_tokens == 0
+
+
+# ---------------------------------------------------------------------------
+# DEF-2 regression tests: populate_context_from_final_metrics must preserve
+# None for unavailable token metrics rather than coercing them to zero.
+# ---------------------------------------------------------------------------
+
+
+def test_populate_context_preserves_none_when_all_token_metrics_absent():
+    """DEF-2: None token fields must not be coerced to 0."""
+    metrics = FinalMetrics(
+        total_prompt_tokens=None,
+        total_cached_tokens=None,
+        total_completion_tokens=None,
+        total_cost_usd=None,
+    )
+    context = AgentContext()
+
+    populate_context_from_final_metrics(context, metrics)
+
+    assert context.n_input_tokens is None, (
+        "n_input_tokens must be None when total_prompt_tokens is absent"
+    )
+    assert context.n_cache_tokens is None, (
+        "n_cache_tokens must be None when total_cached_tokens is absent"
+    )
+    assert context.n_output_tokens is None, (
+        "n_output_tokens must be None when total_completion_tokens is absent"
+    )
+
+
+def test_populate_context_preserves_legitimate_zero_tokens():
+    """DEF-2: explicit 0 tokens must not be coerced to None."""
+    metrics = FinalMetrics(
+        total_prompt_tokens=0,
+        total_cached_tokens=0,
+        total_completion_tokens=0,
+        total_cost_usd=0.0,
+    )
+    context = AgentContext()
+
+    populate_context_from_final_metrics(context, metrics)
+
+    assert context.n_input_tokens == 0
+    assert context.n_cache_tokens == 0
+    assert context.n_output_tokens == 0
+
+
+def test_populate_context_none_and_zero_are_semantically_distinct():
+    """DEF-2: None (no data) and 0 (zero tokens) must produce different context states."""
+    metrics_none = FinalMetrics(total_prompt_tokens=None)
+    metrics_zero = FinalMetrics(total_prompt_tokens=0)
+
+    ctx_none = AgentContext()
+    ctx_zero = AgentContext()
+    populate_context_from_final_metrics(ctx_none, metrics_none)
+    populate_context_from_final_metrics(ctx_zero, metrics_zero)
+
+    assert ctx_none.n_input_tokens is None
+    assert ctx_zero.n_input_tokens == 0
+    assert ctx_none.n_input_tokens != ctx_zero.n_input_tokens
+
+
+def test_populate_context_preserves_nonzero_tokens():
+    """Baseline: non-zero token fields are copied without change."""
+    metrics = FinalMetrics(
+        total_prompt_tokens=512,
+        total_cached_tokens=128,
+        total_completion_tokens=64,
+        total_cost_usd=0.01,
+    )
+    context = AgentContext()
+
+    populate_context_from_final_metrics(context, metrics)
+
+    assert context.n_input_tokens == 512
+    assert context.n_cache_tokens == 128
+    assert context.n_output_tokens == 64
+    assert context.cost_usd == 0.01
+
+
+def test_populate_context_partial_none_preserves_available_values():
+    """DEF-2: partial availability — some fields present, others absent."""
+    metrics = FinalMetrics(
+        total_prompt_tokens=200,
+        total_cached_tokens=None,  # unavailable
+        total_completion_tokens=30,
+        total_cost_usd=0.005,
+    )
+    context = AgentContext()
+
+    populate_context_from_final_metrics(context, metrics)
+
+    assert context.n_input_tokens == 200
+    assert context.n_cache_tokens is None   # preserved, not coerced to 0
+    assert context.n_output_tokens == 30
+
+
+def test_copilot_cli_populate_context_none_when_no_token_shutdown_event(tmp_path: Path):
+    """DEF-2 end-to-end: session killed before any API call leaves token fields as None."""
+    agent = CopilotCli(logs_dir=tmp_path, model_name="gpt-5.4")
+    events_path = (
+        tmp_path / "copilot-home" / "session-state" / "killed-session" / "events.jsonl"
+    )
+    events_path.parent.mkdir(parents=True)
+    # A session that produced a user message but no assistant API calls (killed immediately)
+    events_path.write_text(
+        json.dumps(
+            {
+                "id": "00000000-0000-4000-8000-000000000001",
+                "type": "user.message",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "parentId": None,
+                "data": {"content": "Fix the bug"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    context = AgentContext()
+
+    agent.populate_context_post_run(context)
+
+    # No API calls were made → token metrics must be None, not 0
+    assert context.n_input_tokens is None, (
+        "n_input_tokens must be None when no API calls occurred"
+    )
+    assert context.n_cache_tokens is None
+    assert context.n_output_tokens is None
