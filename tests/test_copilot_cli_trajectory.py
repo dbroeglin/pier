@@ -482,12 +482,16 @@ def test_copilot_cli_populates_context_from_native_session(tmp_path: Path):
     assert context.peak_context_tokens == 2000
     assert context.summarization_count == 1
     assert context.n_agent_steps == 1
-    assert context.metadata == {
-        "copilot_session_events": (
-            Path("copilot-home") / "session-state" / "session-1" / "events.jsonl"
-        ).as_posix(),
-        "copilot_aiu": 0.25,
-    }
+    assert context.metadata is not None
+    assert context.metadata["copilot_session_events"] == (
+        Path("copilot-home") / "session-state" / "session-1" / "events.jsonl"
+    ).as_posix()
+    assert context.metadata["copilot_aiu"] == 0.25
+    # Artifact validation: events.jsonl exists (valid); copilot-cli.jsonl absent
+    # but no download context → status not recorded for the absent JSONL file.
+    assert context.metadata["copilot_events_jsonl_status"] == "valid"
+    assert "copilot_events_jsonl_sha256" in context.metadata
+    assert "copilot_cli_jsonl_status" not in context.metadata
 
 
 def test_copilot_cli_timeout_after_compaction_start_reports_peak_context_tokens(
@@ -961,7 +965,11 @@ def test_copilot_cli_post_run_falls_back_to_the_captured_stream(tmp_path: Path):
 
     trajectory = json.loads((tmp_path / "trajectory.json").read_text(encoding="utf-8"))
     assert trajectory["steps"][0]["message"] == "captured"
-    assert context.metadata is None
+    # copilot-cli.jsonl exists → "valid" with checksum; no events dir → no events status
+    assert context.metadata is not None
+    assert context.metadata["copilot_cli_jsonl_status"] == "valid"
+    assert "copilot_cli_jsonl_sha256" in context.metadata
+    assert "copilot_events_jsonl_status" not in context.metadata
 
 
 def test_copilot_cli_opaque_reasoning_never_reaches_the_trajectory(tmp_path: Path):

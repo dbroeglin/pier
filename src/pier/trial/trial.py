@@ -234,6 +234,7 @@ class Trial:
         self.config = config
         self.job_id = config.job_id
         self._are_agent_logs_downloaded = False
+        self._agent_logs_download_ok = True
         self._are_artifacts_collected = False
         self._is_agent_environment_stopped = False
 
@@ -583,12 +584,14 @@ class Trial:
             )
         except Exception:
             self._logger.error(f"Failed to download logs to {target_dir}")
+            self._agent_logs_download_ok = False
 
         self._are_agent_logs_downloaded = True
 
     def _maybe_populate_agent_context(self, agent_result: AgentContext | None) -> None:
         if agent_result is None or not isinstance(self._agent, BaseInstalledAgent):
             return
+        self._agent.notify_download_complete(self._agent_logs_download_ok)
         if agent_result.is_empty():
             self._agent.populate_context_post_run(agent_result)
         trajectory_path = self._trial_paths.agent_dir / "trajectory.json"
@@ -751,6 +754,7 @@ class Trial:
         for i, step_cfg in enumerate(steps):
             step_name = step_cfg.name
             self._are_agent_logs_downloaded = False
+            self._agent_logs_download_ok = True
 
             if not self._environment.capabilities.mounted:
                 env_paths = self._environment.env_paths

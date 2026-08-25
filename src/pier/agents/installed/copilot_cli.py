@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -9,7 +10,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pier.agents.installed.base import BaseInstalledAgent, CliFlag, with_prompt_template
 from pier.environments.base import BaseEnvironment
@@ -165,6 +166,7 @@ class CopilotCli(BaseInstalledAgent):
         self._command_model_name = command_model_name
         self._extra_args = extra_args
         self._session_id: str | None = None
+        self._download_ok: bool | None = None
         super().__init__(*args, **kwargs)
         # COPILOT_HOME is always controlled by the agent itself; _exec()
         # re-applies _extra_env on top of the constructed env dict, so a
@@ -176,6 +178,9 @@ class CopilotCli(BaseInstalledAgent):
         # _extra_env on top of the constructed env dict.
         if not self._extra_env.get("COPILOT_GITHUB_TOKEN"):
             self._extra_env.pop("COPILOT_GITHUB_TOKEN", None)
+
+    def notify_download_complete(self, ok: bool) -> None:
+        self._download_ok = ok
 
     @staticmethod
     def name() -> str:
@@ -377,6 +382,21 @@ class CopilotCli(BaseInstalledAgent):
             self.logs_dir, session_id=self._session_id
         )
         jsonl_path = self.logs_dir / self._JSONL_FILENAME
+
+        # Validate raw artifact files and record status/checksums in metadata.
+        # This happens unconditionally so corrupt or missing files are always
+        # surfaced rather than silently skipped.
+        validation = validate_copilot_raw_artifacts(
+            self.logs_dir,
+            session_id=self._session_id,
+            download_ok=self._download_ok,
+        )
+        raw_meta = validation.to_metadata_dict()
+        if raw_meta:
+            merged = dict(context.metadata or {})
+            merged.update(raw_meta)
+            context.metadata = merged
+
         persisted_events = _read_jsonl(events_path) if events_path is not None else []
         captured_events = _read_jsonl(jsonl_path)
         events = persisted_events or captured_events
@@ -947,6 +967,144 @@ def find_copilot_session_events(
     if not candidates:
         return None
     return max(candidates, key=lambda candidate: (candidate[0], str(candidate[1])))[1]
+
+
+# ── Raw artifact validation ──────────────────────────────────────────────────
+
+RawArtifactStatus = Literal["valid", "corrupt", "not-produced", "download-failure"]
+"""Status of a single retained Copilot CLI raw artifact file.
+
+- ``"valid"``            – file exists and contains ≥1 parseable JSON object.
+- ``"corrupt"``          – file exists but contains no parseable JSON (empty or
+                           malformed); the SHA-256 is still recorded so the file
+                           can be identified and inspected.
+- ``"not-produced"``     – file absent; download succeeded (or no download step
+                           ran), so the agent simply never wrote this file
+                           (UNK-5 for ``events.jsonl``).
+- ``"download-failure"`` – file absent because the agent-dir download itself
+                           failed before the file could be retrieved.
+"""
+
+
+@dataclass
+class RawArtifactResult:
+    """Validation outcome for both Copilot CLI raw event artifact files."""
+
+    jsonl_status: RawArtifactStatus | None
+    """Status for ``copilot-cli.jsonl``, or ``None`` when the file is absent
+    and no download context is available (e.g. standalone test use)."""
+    jsonl_sha256: str | None
+    """SHA-256 hex digest of ``copilot-cli.jsonl`` when it exists (valid or corrupt)."""
+    events_status: RawArtifactStatus | None
+    """Status for the native ``events.jsonl``, or ``None`` when absent with no
+    download context."""
+    events_sha256: str | None
+    """SHA-256 hex digest of the native ``events.jsonl`` when it exists."""
+
+    def to_metadata_dict(self) -> dict[str, Any]:
+        """Return a flat dict suitable for merging into ``AgentContext.metadata``."""
+        result: dict[str, Any] = {}
+        if self.jsonl_status is not None:
+            result["copilot_cli_jsonl_status"] = self.jsonl_status
+            if self.jsonl_sha256 is not None:
+                result["copilot_cli_jsonl_sha256"] = self.jsonl_sha256
+        if self.events_status is not None:
+            result["copilot_events_jsonl_status"] = self.events_status
+            if self.events_sha256 is not None:
+                result["copilot_events_jsonl_sha256"] = self.events_sha256
+        return result
+
+
+def _sha256_hex(path: Path) -> str:
+    """Return the SHA-256 hex digest of *path*'s contents."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_raw_artifact(
+    path: Path | None,
+    download_ok: bool | None,
+) -> tuple[RawArtifactStatus | None, str | None]:
+    """Validate a single raw artifact file and return *(status, sha256)*.
+
+    *path* is ``None`` when the caller could not locate the file (e.g.
+    ``find_copilot_session_events`` returned ``None``).  *download_ok* is
+    ``None`` when no download step ran (standalone/test use).
+
+    Returns ``(None, None)`` for absent files when *download_ok* is ``None``
+    so that validation metadata is only added to the context when meaningful
+    download-outcome information is available.
+    """
+    if path is not None and path.is_file():
+        try:
+            sha256 = _sha256_hex(path)
+        except OSError:
+            return "corrupt", None
+        line_count = 0
+        try:
+            with path.open(encoding="utf-8-sig", errors="replace", newline="") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        if isinstance(json.loads(line), dict):
+                            line_count += 1
+                    except json.JSONDecodeError:
+                        pass
+        except OSError:
+            return "corrupt", sha256
+        status: RawArtifactStatus = "valid" if line_count > 0 else "corrupt"
+        return status, sha256
+
+    if download_ok is None:
+        return None, None
+    return ("not-produced" if download_ok else "download-failure"), None
+
+
+def validate_copilot_raw_artifacts(
+    agent_dir: Path,
+    *,
+    session_id: str | None = None,
+    download_ok: bool | None = None,
+) -> RawArtifactResult:
+    """Validate Copilot CLI raw event artifact files retained after download.
+
+    Checks ``copilot-cli.jsonl`` and the native
+    ``copilot-home/session-state/<session_id>/events.jsonl`` for existence,
+    JSONL parseability, and computes SHA-256 checksums.
+
+    Args:
+        agent_dir: The host-side agent log directory (``logs_dir`` on the
+            agent / ``_trial_paths.agent_dir`` in the trial).
+        session_id: The ``--session-id`` value passed to the CLI during the
+            run; passed to :func:`find_copilot_session_events` for an exact
+            match before falling back to mtime ordering.
+        download_ok: ``True`` if the agent-dir download succeeded (or the env
+            is mounted), ``False`` if the download failed, ``None`` if no
+            download step was involved (standalone/test use).  Controls whether
+            absent files are reported as ``"not-produced"`` or
+            ``"download-failure"``.
+
+    Returns:
+        A :class:`RawArtifactResult` whose fields are ``None`` for absent files
+        when *download_ok* is ``None``.
+    """
+    jsonl_path = agent_dir / CopilotCli._JSONL_FILENAME
+    events_path = find_copilot_session_events(agent_dir, session_id=session_id)
+
+    jsonl_status, jsonl_sha256 = _validate_raw_artifact(jsonl_path, download_ok)
+    events_status, events_sha256 = _validate_raw_artifact(events_path, download_ok)
+
+    return RawArtifactResult(
+        jsonl_status=jsonl_status,
+        jsonl_sha256=jsonl_sha256,
+        events_status=events_status,
+        events_sha256=events_sha256,
+    )
 
 
 _TURN_BOUNDARY_EVENTS = frozenset(
