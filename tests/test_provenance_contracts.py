@@ -340,6 +340,7 @@ def _fake_trial_for_populate(
         _result=result,
         _trial_paths=SimpleNamespace(agent_dir=agent_dir),
         config=SimpleNamespace(context_overlay_id=context_overlay_id),
+        _agent_logs_download_ok=True,
     )
 
 
