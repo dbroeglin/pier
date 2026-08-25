@@ -291,6 +291,18 @@ class BaseInstalledAgent(BaseAgent, ABC):
         """
         pass
 
+    def notify_download_complete(self, ok: bool) -> None:
+        """Inform the agent whether the post-run agent-dir download succeeded.
+
+        Called by the trial runner immediately before ``populate_context_post_run``
+        so provider-specific implementations can distinguish a missing file that
+        was never produced from one that failed to download.
+
+        The default is a no-op; override in provider agents that need to
+        distinguish "not produced" from "download failure" in their artifact
+        validation.
+        """
+
     def version(self) -> str | None:
         return self._version
 
