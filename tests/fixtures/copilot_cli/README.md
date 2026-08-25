@@ -17,3 +17,6 @@ counts are preserved. Regenerate them with
 | `session_timeout.jsonl` | A stream killed mid-write, ending in a truncated line |
 | `session_model_change.jsonl` | `session.model_change` and AIU accounting |
 | `session_system_events.jsonl` | `system.message` steps and an `abort` |
+| `session_truncation.jsonl` | `session.truncation` plus compaction success/failure semantics |
+| `session_error.jsonl` | `session.error` auth/network failure shape |
+| `session_unknown_event.jsonl` | Forward-compatible unknown event in an otherwise valid run |

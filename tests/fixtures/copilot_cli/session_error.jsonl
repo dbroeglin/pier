@@ -1,0 +1,4 @@
+{"type":"session.start","timestamp":"2026-01-01T00:00:00.000Z","data":{"sessionId":"session-error","selectedModel":"gpt-5.4"}}
+{"type":"user.message","timestamp":"2026-01-01T00:00:00.100Z","data":{"content":"Synthetic request"}}
+{"type":"assistant.message","timestamp":"2026-01-01T00:00:00.200Z","data":{"apiCallId":"api-1","model":"gpt-5.4","content":"Attempting to run","inputTokens":40,"outputTokens":6}}
+{"type":"session.error","timestamp":"2026-01-01T00:00:00.300Z","data":{"errorType":"AuthError","message":"401 Unauthorized","code":"E401","statusCode":401,"source":"network","fatal":true}}

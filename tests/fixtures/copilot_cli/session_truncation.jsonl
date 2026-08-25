@@ -1,0 +1,8 @@
+{"type":"session.start","timestamp":"2026-01-01T00:00:00.000Z","data":{"sessionId":"session-truncation","selectedModel":"gpt-5.4"}}
+{"type":"user.message","timestamp":"2026-01-01T00:00:00.100Z","data":{"content":"Synthetic request"}}
+{"type":"assistant.message","timestamp":"2026-01-01T00:00:00.200Z","data":{"apiCallId":"api-1","model":"gpt-5.4","content":"Working on it","inputTokens":120,"outputTokens":18}}
+{"type":"session.compaction_complete","timestamp":"2026-01-01T00:00:00.300Z","data":{"success":true,"summaryContent":"Summary after compaction.","preCompactionTokens":2400,"checkpointNumber":1,"trigger":"threshold"}}
+{"type":"assistant.message","timestamp":"2026-01-01T00:00:00.400Z","data":{"apiCallId":"api-2","model":"gpt-5.4","content":"Continuing after summary","inputTokens":80,"outputTokens":12}}
+{"type":"session.compaction_complete","timestamp":"2026-01-01T00:00:00.500Z","data":{"success":false,"error":"Compaction failed","preCompactionTokens":6100}}
+{"type":"session.truncation","timestamp":"2026-01-01T00:00:00.600Z","data":{"preTruncationTokensInMessages":7700}}
+{"type":"session.shutdown","timestamp":"2026-01-01T00:00:00.700Z","data":{"currentTokens":900,"tokenDetails":{"input":{"tokenCount":200},"cache_read":{"tokenCount":30},"cache_write":{"tokenCount":10},"output":{"tokenCount":30}}}}

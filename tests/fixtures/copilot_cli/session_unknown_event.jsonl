@@ -1,0 +1,5 @@
+{"type":"session.start","timestamp":"2026-01-01T00:00:00.000Z","data":{"sessionId":"session-unknown-event","selectedModel":"gpt-5.4"}}
+{"type":"user.message","timestamp":"2026-01-01T00:00:00.100Z","data":{"content":"Synthetic request"}}
+{"type":"unknown.future.event","timestamp":"2026-01-01T00:00:00.200Z","data":{"nested":{"shape":"forward-compatible"}}}
+{"type":"assistant.message","timestamp":"2026-01-01T00:00:00.300Z","data":{"apiCallId":"api-1","model":"gpt-5.4","content":"Done","inputTokens":15,"outputTokens":3}}
+{"type":"session.shutdown","timestamp":"2026-01-01T00:00:00.400Z","data":{"tokenDetails":{"input":{"tokenCount":15},"cache_read":{"tokenCount":0},"cache_write":{"tokenCount":0},"output":{"tokenCount":3}}}}
