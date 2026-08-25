@@ -104,8 +104,7 @@ def _mock_agent(*, run_side_effect=None) -> MagicMock:
     run_mock = AsyncMock()
     if run_side_effect is not None:
         run_mock.side_effect = run_side_effect
-    return MagicMock(
-        name=lambda: "oracle",
+    agent = MagicMock(
         version=lambda: "1.0",
         SUPPORTS_WINDOWS=True,
         setup=AsyncMock(),
@@ -114,6 +113,13 @@ def _mock_agent(*, run_side_effect=None) -> MagicMock:
         install_spec=lambda: None,
         network_allowlist=lambda: None,
     )
+    agent.name = lambda: "oracle"
+    return agent
+
+
+def test_mock_agent_helper_name_returns_oracle() -> None:
+    agent = _mock_agent()
+    assert agent.name() == "oracle"
 
 
 async def _run_trial(
