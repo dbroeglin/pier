@@ -58,6 +58,7 @@ from pier.trial.execution import (
     TrialExecution,
 )
 from pier.utils.logger import logger
+from pier.utils.trajectory_utils import format_trajectory_json
 from pier.verifier.verifier import Verifier
 
 
@@ -132,6 +133,48 @@ def _agent_step_count_from_trajectory_path(trajectory_path: Path) -> int | None:
         if step.get("source") == "agent":
             total += 1
     return total if found_steps else None
+
+
+def _stamp_trajectory_trial_id(trajectory_path: Path, trial_id: str) -> None:
+    """Inject pier_trial_id into the root trajectory's extra dict on disk.
+
+    Called at the Trial↔agent plumbing boundary so any analysis pipeline can
+    join trajectory files back to their TrialResult without scanning all
+    result.json files. Only the top-level ``extra`` dict is modified; subagent
+    trajectories nested under ``subagent_trajectories`` are not affected.
+    """
+    if not trajectory_path.exists():
+        return
+    try:
+        data = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    extra = data.get("extra") or {}
+    extra["pier_trial_id"] = trial_id
+    data["extra"] = extra
+    try:
+        trajectory_path.write_text(
+            format_trajectory_json(data),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _mirror_overlay_to_metadata(
+    context: "AgentContext", context_overlay_id: str | None
+) -> None:
+    """Mirror a non-None context_overlay_id from TrialConfig into AgentContext.metadata.
+
+    Existing metadata keys are preserved; only ``context_overlay_id`` is added
+    or overwritten. When ``context_overlay_id`` is None the context is unchanged.
+    """
+    if context_overlay_id is None:
+        return
+    metadata = dict(context.metadata or {})
+    metadata["context_overlay_id"] = context_overlay_id
+    context.metadata = metadata
+
 
 
 def _min_reward_failure(
@@ -544,10 +587,14 @@ class Trial:
             return
         if agent_result.is_empty():
             self._agent.populate_context_post_run(agent_result)
+        trajectory_path = self._trial_paths.agent_dir / "trajectory.json"
+        if self._result is not None:
+            _stamp_trajectory_trial_id(trajectory_path, str(self._result.id))
         if agent_result.n_agent_steps is None:
             agent_result.n_agent_steps = _agent_step_count_from_trajectory_path(
-                self._trial_paths.agent_dir / "trajectory.json"
+                trajectory_path
             )
+        _mirror_overlay_to_metadata(agent_result, self.config.context_overlay_id)
 
     def _create_step_dirs(self, step_name: str) -> tuple[Path, Path]:
         """Create and return (agent_dir, verifier_dir) for a step."""

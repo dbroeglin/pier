@@ -100,6 +100,7 @@ class TrialLock(BaseModel):
     agent: AgentConfig
     environment: EnvironmentConfig
     verifier: VerifierConfig
+    context_overlay_id: str | None = None
 
 
 class JobLock(BaseModel):
@@ -169,6 +170,7 @@ def _build_lock_trial(trial_config: TrialConfig) -> TrialLock:
         agent=trial_config.agent,
         environment=trial_config.environment,
         verifier=trial_config.verifier,
+        context_overlay_id=trial_config.context_overlay_id,
     )
 
 

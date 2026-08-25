@@ -258,6 +258,7 @@ class TrialConfig(BaseModel):
     verifier: VerifierConfig = Field(default_factory=VerifierConfig)
     artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
     job_id: UUID | None = None
+    context_overlay_id: str | None = None
 
     def __eq__(self, other):
         if not isinstance(other, TrialConfig):
