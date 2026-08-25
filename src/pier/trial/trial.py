@@ -157,8 +157,12 @@ def _stamp_trajectory_trial_id(trajectory_path: Path, trial_id: str) -> None:
             format_trajectory_json(data),
             encoding="utf-8",
         )
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning(
+            "Failed to write pier_trial_id to trajectory %s: %s",
+            trajectory_path,
+            exc,
+        )
 
 
 def _mirror_overlay_to_metadata(

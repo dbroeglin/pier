@@ -7,14 +7,20 @@ Covers:
 - Metadata merge: existing metadata keys are preserved during mirroring
 - Root-only provenance: pier_trial_id stamped on root trajectory, not subagents
 - Per-trial bijection: each TrialResult receives a unique UUID
+- _maybe_populate_agent_context integration boundary (UUID/overlay/metadata/sequencing)
+- _stamp_trajectory_trial_id write-failure emits observable warning
 """
 
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import UUID
 
 import pytest
 
+from pier.agents.installed.base import BaseInstalledAgent
 from pier.models.agent.context import AgentContext
 from pier.models.job.lock import TrialLock, _build_lock_trial
 from pier.models.task.id import LocalTaskId
@@ -26,7 +32,11 @@ from pier.models.trial.config import (
     VerifierConfig,
 )
 from pier.models.trial.result import AgentInfo, TrialResult
-from pier.trial.trial import _mirror_overlay_to_metadata, _stamp_trajectory_trial_id
+from pier.trial.trial import (
+    Trial,
+    _mirror_overlay_to_metadata,
+    _stamp_trajectory_trial_id,
+)
 from pier.utils.trajectory_utils import format_trajectory_json
 
 
@@ -280,3 +290,269 @@ def test_ten_trial_results_all_have_unique_ids(tmp_path: Path) -> None:
     config = _trial_config(tmp_path)
     ids = {_trial_result(config, tmp_path).id for _ in range(10)}
     assert len(ids) == 10
+
+
+# ---------------------------------------------------------------------------
+# _maybe_populate_agent_context integration boundary (VAL-003/VAL-004)
+# ---------------------------------------------------------------------------
+
+
+class _StubInstalledAgent(BaseInstalledAgent):
+    """Minimal concrete BaseInstalledAgent for boundary testing."""
+
+    @staticmethod
+    def name() -> str:
+        return "stub"
+
+    def version(self) -> str | None:
+        return "0.0"
+
+    async def setup(self, environment) -> None:  # type: ignore[override]
+        pass
+
+    async def run(self, instruction, environment, context) -> None:  # type: ignore[override]
+        pass
+
+    def populate_context_post_run(self, context: AgentContext) -> None:
+        pass
+
+    def install_spec(self):  # type: ignore[override]
+        return None
+
+
+def _stub_agent(tmp_path: Path) -> _StubInstalledAgent:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    return _StubInstalledAgent(logs_dir=logs_dir)
+
+
+def _fake_trial_for_populate(
+    tmp_path: Path,
+    *,
+    result: TrialResult | None,
+    context_overlay_id: str | None = None,
+) -> SimpleNamespace:
+    """Build a minimal SimpleNamespace that satisfies _maybe_populate_agent_context."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(
+        _agent=_stub_agent(tmp_path),
+        _result=result,
+        _trial_paths=SimpleNamespace(agent_dir=agent_dir),
+        config=SimpleNamespace(context_overlay_id=context_overlay_id),
+    )
+
+
+def _write_trajectory(agent_dir: Path, data: dict) -> Path:
+    trajectory_path = agent_dir / "trajectory.json"
+    trajectory_path.write_text(format_trajectory_json(data), encoding="utf-8")
+    return trajectory_path
+
+
+def test_maybe_populate_stamps_exact_result_id_into_trajectory(
+    tmp_path: Path,
+) -> None:
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(tmp_path, result=result)
+
+    data = _minimal_trajectory_dict()
+    _write_trajectory(trial._trial_paths.agent_dir, data)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    stamped = json.loads(
+        (trial._trial_paths.agent_dir / "trajectory.json").read_text(encoding="utf-8")
+    )
+    stamped_id = stamped["extra"]["pier_trial_id"]
+    assert stamped_id == str(result.id)
+    assert UUID(stamped_id) == result.id
+
+
+def test_maybe_populate_mirrors_context_overlay_id_when_present(
+    tmp_path: Path,
+) -> None:
+    config = _trial_config(tmp_path, context_overlay_id="treatment-v2")
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(
+        tmp_path, result=result, context_overlay_id="treatment-v2"
+    )
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    assert agent_result.metadata is not None
+    assert agent_result.metadata["context_overlay_id"] == "treatment-v2"
+
+
+def test_maybe_populate_no_overlay_key_when_context_overlay_id_is_none(
+    tmp_path: Path,
+) -> None:
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(tmp_path, result=result, context_overlay_id=None)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    assert agent_result.metadata is None or "context_overlay_id" not in (
+        agent_result.metadata or {}
+    )
+
+
+def test_maybe_populate_preserves_unrelated_metadata(tmp_path: Path) -> None:
+    config = _trial_config(tmp_path, context_overlay_id="ov-1")
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(
+        tmp_path, result=result, context_overlay_id="ov-1"
+    )
+
+    agent_result = AgentContext(metadata={"copilot_aiu": 3.7, "other": "kept"})
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    assert agent_result.metadata is not None
+    assert agent_result.metadata["copilot_aiu"] == 3.7
+    assert agent_result.metadata["other"] == "kept"
+    assert agent_result.metadata["context_overlay_id"] == "ov-1"
+
+
+def test_maybe_populate_stamp_occurs_before_step_count_reads_trajectory(
+    tmp_path: Path,
+) -> None:
+    """Stamping writes pier_trial_id before step-count reads the same file."""
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(tmp_path, result=result)
+
+    data = _minimal_trajectory_dict()
+    data["steps"] = [
+        {"step_id": 1, "source": "user", "message": "hi"},
+        {"step_id": 2, "source": "agent", "message": "done"},
+    ]
+    _write_trajectory(trial._trial_paths.agent_dir, data)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    stamped = json.loads(
+        (trial._trial_paths.agent_dir / "trajectory.json").read_text(encoding="utf-8")
+    )
+    # Stamped before step-count read, so both are set from the same file content
+    assert "pier_trial_id" in stamped["extra"]
+    assert agent_result.n_agent_steps == 1  # one agent step in the trajectory
+
+
+def test_maybe_populate_result_none_guard_skips_stamping(tmp_path: Path) -> None:
+    """When _result is None the stamp must not be attempted and no error raised."""
+    config = _trial_config(tmp_path)
+    trial = _fake_trial_for_populate(tmp_path, result=None)
+
+    data = _minimal_trajectory_dict()
+    traj_path = _write_trajectory(trial._trial_paths.agent_dir, data)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    after = json.loads(traj_path.read_text(encoding="utf-8"))
+    assert "pier_trial_id" not in (after.get("extra") or {})
+
+
+def test_maybe_populate_agent_result_none_guard_returns_early(
+    tmp_path: Path,
+) -> None:
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(tmp_path, result=result)
+
+    # Must not raise even with no trajectory file present
+    Trial._maybe_populate_agent_context(trial, None)
+
+
+def test_maybe_populate_non_installed_agent_guard_returns_early(
+    tmp_path: Path,
+) -> None:
+    """When _agent is not a BaseInstalledAgent the method must be a no-op."""
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(tmp_path, result=result)
+    trial._agent = object()  # not a BaseInstalledAgent
+
+    data = _minimal_trajectory_dict()
+    traj_path = _write_trajectory(trial._trial_paths.agent_dir, data)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    after = json.loads(traj_path.read_text(encoding="utf-8"))
+    assert "pier_trial_id" not in (after.get("extra") or {})
+    assert agent_result.metadata is None
+
+
+def test_maybe_populate_called_after_agent_timeout_still_stamps(
+    tmp_path: Path,
+) -> None:
+    """Simulates the failure/timeout path: _result is already set, agent_result populated."""
+    config = _trial_config(tmp_path, context_overlay_id="baseline")
+    result = _trial_result(config, tmp_path)
+    trial = _fake_trial_for_populate(
+        tmp_path, result=result, context_overlay_id="baseline"
+    )
+
+    data = _minimal_trajectory_dict()
+    _write_trajectory(trial._trial_paths.agent_dir, data)
+
+    # Simulate partial context collected before timeout
+    agent_result = AgentContext(n_input_tokens=500, n_output_tokens=100)
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    stamped = json.loads(
+        (trial._trial_paths.agent_dir / "trajectory.json").read_text(encoding="utf-8")
+    )
+    assert stamped["extra"]["pier_trial_id"] == str(result.id)
+    assert agent_result.metadata is not None
+    assert agent_result.metadata["context_overlay_id"] == "baseline"
+    # Existing token counts survive
+    assert agent_result.n_input_tokens == 500
+    assert agent_result.n_output_tokens == 100
+
+
+# ---------------------------------------------------------------------------
+# Write-failure: observable warning (not silent pass)
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_trajectory_trial_id_write_failure_emits_warning(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A write OSError must produce a structured warning, not a silent pass."""
+    trajectory_path = tmp_path / "trajectory.json"
+    data = _minimal_trajectory_dict()
+    trajectory_path.write_text(format_trajectory_json(data), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="pier"):
+        with patch.object(
+            Path,
+            "write_text",
+            side_effect=OSError("disk full"),
+        ):
+            _stamp_trajectory_trial_id(trajectory_path, "fail-uuid")
+
+    warning_messages = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("pier_trial_id" in m or str(trajectory_path) in m for m in warning_messages), (
+        f"Expected a warning mentioning the path or pier_trial_id; got: {warning_messages}"
+    )
+
+
+def test_stamp_trajectory_trial_id_write_failure_does_not_raise(
+    tmp_path: Path,
+) -> None:
+    """A write OSError must not propagate — the trial must remain runnable."""
+    trajectory_path = tmp_path / "trajectory.json"
+    data = _minimal_trajectory_dict()
+    trajectory_path.write_text(format_trajectory_json(data), encoding="utf-8")
+
+    with patch.object(Path, "write_text", side_effect=OSError("read-only fs")):
+        # Must not raise
+        _stamp_trajectory_trial_id(trajectory_path, "fail-uuid")
