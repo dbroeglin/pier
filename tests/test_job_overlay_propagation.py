@@ -9,7 +9,7 @@ Covers:
 - Multiple tasks × agents × attempts all receive the overlay
 - JobLock / TrialLock records the propagated overlay deterministically
 - Legacy lock JSON without context_overlay_id in TrialLock loads as None
-- No loss at AgentContext mirroring boundary: overlay reaches metadata
+- Production overlay mirroring: TrialConfig value passes to _mirror_overlay_to_metadata
 """
 
 import json
@@ -23,6 +23,7 @@ from pier.models.agent.context import AgentContext
 from pier.models.job.config import JobConfig
 from pier.models.job.lock import JobLock, TrialLock, build_job_lock, _build_lock_trial
 from pier.models.trial.config import AgentConfig, TaskConfig, TrialConfig
+from pier.trial.trial import _mirror_overlay_to_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -230,28 +231,25 @@ def test_job_lock_round_trips_with_overlay(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AgentContext mirroring boundary: no loss from JobConfig → metadata
+# Production overlay mirroring: TrialConfig value passes to _mirror_overlay_to_metadata
 # ---------------------------------------------------------------------------
 
 
 def test_overlay_reaches_agent_context_metadata(tmp_path: Path) -> None:
-    """JobConfig overlay propagated through TrialConfig is available for metadata mirroring.
+    """TrialConfig.context_overlay_id can be passed to production _mirror_overlay_to_metadata.
 
-    This test does NOT call Trial._maybe_populate_agent_context directly (that
-    integration path is covered by test_provenance_contracts.py). Instead it verifies
-    that, after _init_trial_configs, every TrialConfig.context_overlay_id carries the
-    expected value so the downstream mirroring call will receive the correct input.
+    Verifies that after _init_trial_configs, every TrialConfig.context_overlay_id
+    value is compatible with the production _mirror_overlay_to_metadata function.
+    Full integration path (_maybe_populate_agent_context) is covered by
+    test_provenance_contracts.py.
     """
     job = _make_job(tmp_path, context_overlay_id="baseline-v1")
     job._close_logger_handlers()
 
     for tc in job._trial_configs:
-        # Simulate what _mirror_overlay_to_metadata does: copy overlay into metadata.
+        # Call the real production function with the propagated overlay value.
         ctx = AgentContext()
-        if tc.context_overlay_id is not None:
-            metadata = dict(ctx.metadata or {})
-            metadata["context_overlay_id"] = tc.context_overlay_id
-            ctx.metadata = metadata
+        _mirror_overlay_to_metadata(ctx, tc.context_overlay_id)
         assert ctx.metadata == {"context_overlay_id": "baseline-v1"}
 
 
@@ -260,11 +258,9 @@ def test_none_overlay_leaves_agent_context_metadata_unchanged(tmp_path: Path) ->
     job._close_logger_handlers()
 
     for tc in job._trial_configs:
+        # Call the real production function with None overlay.
         ctx = AgentContext(metadata={"pre_existing": "value"})
-        if tc.context_overlay_id is not None:
-            metadata = dict(ctx.metadata or {})
-            metadata["context_overlay_id"] = tc.context_overlay_id
-            ctx.metadata = metadata
+        _mirror_overlay_to_metadata(ctx, tc.context_overlay_id)
         # overlay is None → metadata unchanged
         assert ctx.metadata == {"pre_existing": "value"}
         assert "context_overlay_id" not in (ctx.metadata or {})
