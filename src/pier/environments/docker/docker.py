@@ -193,9 +193,7 @@ class DockerEnvironment(BaseEnvironment):
             self._windows_container_name: str | None = None
             self._platform = UnixOps(self)
 
-        self._mounts_json = (
-            mounts_json if mounts_json is not None else self._default_log_mounts()
-        )
+        self._mounts_json = self._default_log_mounts() + (mounts_json or [])
         self._mounts_compose_path: Path | None = None
         self._resources_compose_temp_dir: tempfile.TemporaryDirectory | None = None
         self._resources_compose_path: Path | None = None
