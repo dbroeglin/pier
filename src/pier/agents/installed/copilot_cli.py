@@ -34,6 +34,19 @@ from pier.utils.trajectory_metrics import populate_context_from_final_metrics
 from pier.utils.trajectory_utils import format_trajectory_json
 
 
+# GitHub AI credits: totalNanoAiu / 1e9 = AI credits (per GitHub Copilot SDK docs)
+# Public list price: $0.01 USD per AI credit (per GitHub pricing docs)
+# Sources:
+#   https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing
+#   https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing
+_GITHUB_AI_CREDIT_RATE_USD: float = 0.01
+_GITHUB_AI_CREDIT_RATE_BASIS: str = "github-public-ai-credit-list-price"
+_GITHUB_AI_CREDIT_RATE_AS_OF: str = "2026-08-26"
+_GITHUB_AI_CREDIT_RATE_SOURCE: str = (
+    "https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing"
+)
+
+
 @dataclass
 class _SessionMetrics:
     input_tokens: int | None
@@ -43,6 +56,22 @@ class _SessionMetrics:
     summarization_count: int
     aiu: float | None
     premium_requests: int | None
+    # Additive provenance fields (Task A/C)
+    cache_write_tokens: int | None = None
+    """Cache-write tokens (a component already included in input_tokens; additive metadata)."""
+    token_accounting_source: str | None = None
+    """Which billing data source produced the canonical token totals.
+
+    - ``"tokenDetails"``            – session.shutdown.tokenDetails (billing record)
+    - ``"modelMetrics"``            – session.shutdown.modelMetrics (may miss compaction calls)
+    - ``"assistant_usage"``         – reconciled assistant.usage events (no-shutdown path)
+    - ``"assistant_message"``       – assistant.message input/output only (no usage events)
+    """
+    # Alternative modelMetrics totals when tokenDetails was canonical (Task C)
+    mm_input_tokens: int | None = None
+    mm_cache_read_tokens: int | None = None
+    mm_cache_write_tokens: int | None = None
+    mm_output_tokens: int | None = None
 
 
 @dataclass
@@ -64,6 +93,13 @@ class _Scope:
     abort_reasons: list[str] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
     selected_agents: list[str] = field(default_factory=list)
+    observed_models: list[str] = field(default_factory=list)
+    """Ordered, deduplicated list of model identifiers observed in this scope's events.
+
+    Populated from ``session.start.selectedModel``, ``session.model_change.newModel``,
+    and ``assistant.message.model`` fields. Only records models explicitly present in
+    event data — never a configured fallback — so it is always direct evidence.
+    """
 
 
 @dataclass
@@ -430,6 +466,28 @@ class CopilotCli(BaseInstalledAgent):
             metadata["copilot_aiu"] = session_metrics.aiu
         if session_metrics.premium_requests is not None:
             metadata["copilot_premium_requests"] = session_metrics.premium_requests
+
+        # Propagate provenance from trajectory.final_metrics.extra to metadata
+        # so downstream (including Trial._maybe_populate_agent_context) can
+        # access them without re-parsing the trajectory file.
+        if trajectory.final_metrics is not None:
+            final_extra = trajectory.final_metrics.extra or {}
+            _copy_extra_keys_to_metadata(
+                final_extra,
+                metadata,
+                (
+                    "copilot_cost_rate_usd_per_credit",
+                    "copilot_cost_basis",
+                    "copilot_cost_source",
+                    "copilot_cost_as_of",
+                    "copilot_observed_models",
+                    "copilot_model_provenance_source",
+                    "copilot_requested_model",
+                    "token_accounting_source",
+                    "input_includes_cache",
+                    "cache_write_tokens",
+                ),
+            )
         context.metadata = metadata or None
 
     def _convert_events_to_trajectory(
@@ -493,6 +551,55 @@ class CopilotCli(BaseInstalledAgent):
         if root.selected_agents:
             extra["copilot_selected_agents"] = root.selected_agents
 
+        # Task A: Public-list cost provenance — rate, basis, source URL, as-of date.
+        # Derived: AI credits × public-list rate = public-list USD equivalent.
+        aiu = session_metrics.aiu
+        if aiu is not None:
+            extra["copilot_cost_rate_usd_per_credit"] = _GITHUB_AI_CREDIT_RATE_USD
+            extra["copilot_cost_basis"] = _GITHUB_AI_CREDIT_RATE_BASIS
+            extra["copilot_cost_source"] = _GITHUB_AI_CREDIT_RATE_SOURCE
+            extra["copilot_cost_as_of"] = _GITHUB_AI_CREDIT_RATE_AS_OF
+        cost_usd = (
+            round(aiu * _GITHUB_AI_CREDIT_RATE_USD, 10) if aiu is not None else None
+        )
+
+        # Task B: Structured model provenance from native/root event evidence.
+        # observed_models contains only models explicitly present in event data.
+        if root.observed_models:
+            extra["copilot_observed_models"] = list(root.observed_models)
+            extra["copilot_model_provenance_source"] = "session_events"
+            # If a specific model was requested via --model but differs from the
+            # first observed (server-selected) model, preserve both.
+            requested_model = self._command_model_name or (
+                self.model_name.split("/")[-1] if self.model_name else None
+            )
+            if requested_model and requested_model != root.observed_models[0]:
+                extra["copilot_requested_model"] = requested_model
+
+        # Task C: Token-accounting provenance.
+        # token_accounting_source documents which billing data produced canonical totals.
+        # input_includes_cache: the prompt total already incorporates cache components;
+        #   downstream must not add cache_read or cache_write to input again.
+        # cache_write_tokens: additive, separate from cache_read; kept alongside n_cache_tokens
+        #   (which covers cache-read) for completeness without changing existing semantics.
+        if session_metrics.token_accounting_source is not None:
+            extra["token_accounting_source"] = session_metrics.token_accounting_source
+        if session_metrics.input_tokens is not None and session_metrics.token_accounting_source in (
+            "tokenDetails", "modelMetrics", "assistant_usage"
+        ):
+            extra["input_includes_cache"] = True
+        if session_metrics.cache_write_tokens is not None:
+            extra["cache_write_tokens"] = session_metrics.cache_write_tokens
+        # Preserve modelMetrics alternative totals when tokenDetails was canonical (delta visibility).
+        if session_metrics.mm_input_tokens is not None:
+            extra["copilot_mm_input_tokens"] = session_metrics.mm_input_tokens
+        if session_metrics.mm_cache_read_tokens is not None:
+            extra["copilot_mm_cache_read_tokens"] = session_metrics.mm_cache_read_tokens
+        if session_metrics.mm_cache_write_tokens is not None:
+            extra["copilot_mm_cache_write_tokens"] = session_metrics.mm_cache_write_tokens
+        if session_metrics.mm_output_tokens is not None:
+            extra["copilot_mm_output_tokens"] = session_metrics.mm_output_tokens
+
         return Trajectory(
             schema_version="ATIF-v1.7",
             session_id=root.session_id or "copilot-cli",
@@ -506,6 +613,7 @@ class CopilotCli(BaseInstalledAgent):
                 total_prompt_tokens=session_metrics.input_tokens,
                 total_completion_tokens=session_metrics.output_tokens,
                 total_cached_tokens=session_metrics.cache_read_tokens,
+                total_cost_usd=cost_usd,
                 total_steps=len(root.steps),
                 extra=extra,
             ),
@@ -659,6 +767,8 @@ class CopilotCli(BaseInstalledAgent):
                     scope.session_id = session_id
                 if model := _string_or_none(data.get("selectedModel")):
                     current_model = model
+                    if model not in scope.observed_models:
+                        scope.observed_models.append(model)
                 if effort := _string_or_none(data.get("reasoningEffort")):
                     current_effort = effort
                 continue
@@ -666,6 +776,8 @@ class CopilotCli(BaseInstalledAgent):
             if event_type == "session.model_change":
                 if model := _string_or_none(data.get("newModel")):
                     current_model = model
+                    if model not in scope.observed_models:
+                        scope.observed_models.append(model)
                 if effort := _string_or_none(data.get("reasoningEffort")):
                     current_effort = effort
                 continue
@@ -769,6 +881,10 @@ class CopilotCli(BaseInstalledAgent):
                 pending_reasoning = ""
                 pending_reasoning_timestamp = None
                 message = _flatten_content(data.get("content"))
+                # Track explicitly reported model names as evidence (B: model provenance)
+                if event_model := _string_or_none(data.get("model")):
+                    if event_model not in scope.observed_models:
+                        scope.observed_models.append(event_model)
                 if assistant_event_id and (
                     existing_step := assistant_steps_by_id.get(assistant_event_id)
                 ):
@@ -793,7 +909,7 @@ class CopilotCli(BaseInstalledAgent):
                         step_id=1,
                         timestamp=timestamp,
                         source="agent",
-                        model_name=_string_or_none(data.get("model")) or current_model,
+                        model_name=event_model or current_model,
                         reasoning_effort=current_effort,
                         message=message,
                         reasoning_content=reasoning_content or None,
@@ -1372,16 +1488,28 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
                 prompt_tokens if has_usage_prompt or has_message_input else None
             ),
             cache_read_tokens=(usage_cache_read if has_usage_cache_read else None),
+            cache_write_tokens=(usage_cache_write if has_usage_cache_write else None),
             output_tokens=output_tokens if has_output else None,
             peak_context_tokens=peak_context_tokens or None,
             summarization_count=summarization_count,
             aiu=_nano_aiu_to_aiu(checkpoint_nano_aiu),
             premium_requests=reported_premium_requests,
+            token_accounting_source=(
+                "assistant_usage" if has_usage_prompt else (
+                    "assistant_message" if has_message_input else None
+                )
+            ),
         )
 
     prompt_total = 0
     cache_read = 0
+    cache_write_total = 0
     output = 0
+    # Track which billing source each shutdown used and collect modelMetrics
+    # alternative totals when tokenDetails is the canonical source.
+    td_count = 0   # shutdowns that used tokenDetails
+    mm_count = 0   # shutdowns that used modelMetrics
+    mm_alternatives: list[tuple[int, int, int, int]] = []
     for shutdown in shutdowns:
         # `tokenDetails` is the billing record -- it is what `totalNanoAiu` is
         # derived from -- and it counts every call the session made, including
@@ -1390,19 +1518,57 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
         # `modelMetrics` here under-reported a compacting session's tokens by
         # as much as a third. `modelMetrics` remains the fallback for streams
         # that carry no `tokenDetails` at all.
-        usage = _shutdown_token_details_usage(shutdown) or _shutdown_model_usage(
-            shutdown
-        )
-        if usage is None:
+        td_usage = _shutdown_token_details_usage(shutdown)
+        mm_usage = _shutdown_model_usage(shutdown)
+        if td_usage is not None:
+            usage = td_usage
+            td_count += 1
+            # Preserve modelMetrics alternative for delta visibility (Task C).
+            if mm_usage is not None:
+                mm_alternatives.append(mm_usage)
+        elif mm_usage is not None:
+            usage = mm_usage
+            mm_count += 1
+        else:
             continue
         prompt_total += usage[0]
         cache_read += usage[1]
+        cache_write_total += usage[2]
         output += usage[3]
-    nano_aiu = sum(
+
+    # Overall source: tokenDetails wins if any shutdown used it (it is more complete).
+    if td_count > 0:
+        shutdown_source: str | None = "tokenDetails"
+    elif mm_count > 0:
+        shutdown_source = "modelMetrics"
+    else:
+        shutdown_source = None
+
+    # Aggregate modelMetrics alternatives (only meaningful when tokenDetails was canonical).
+    mm_input: int | None = None
+    mm_cache_read: int | None = None
+    mm_cache_write: int | None = None
+    mm_output: int | None = None
+    if mm_alternatives:
+        mm_input_total, has_mm_input = _sum_optional(t[0] for t in mm_alternatives)
+        mm_cr_total, has_mm_cr = _sum_optional(t[1] for t in mm_alternatives)
+        mm_cw_total, has_mm_cw = _sum_optional(t[2] for t in mm_alternatives)
+        mm_out_total, has_mm_out = _sum_optional(t[3] for t in mm_alternatives)
+        mm_input = mm_input_total if has_mm_input else None
+        mm_cache_read = mm_cr_total if has_mm_cr else None
+        mm_cache_write = mm_cw_total if has_mm_cw else None
+        mm_output = mm_out_total if has_mm_out else None
+
+    # Sum totalNanoAiu across shutdowns. Track whether any shutdown carried it to
+    # distinguish "zero billed" (nano_aiu_reported=True, sum=0.0) from "not reported"
+    # (nano_aiu_reported=False). Using `sum or checkpoint` would treat 0.0 as absent.
+    shutdown_nano_aiu_values = [
         float(value)
         for shutdown in shutdowns
         if isinstance(value := shutdown.get("totalNanoAiu"), (int, float))
-    )
+        and not isinstance(value, bool)
+    ]
+    nano_aiu_sum = sum(shutdown_nano_aiu_values)
     # A resumed session shuts down more than once, and each shutdown reports the
     # requests billed for its own run, so these sum the way AIU does.
     shutdown_premium_requests, has_premium_requests = _sum_optional(
@@ -1412,20 +1578,35 @@ def _parse_session_metrics(events: list[dict[str, Any]]) -> _SessionMetrics:
     return _SessionMetrics(
         input_tokens=prompt_total,
         cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write_total if (td_count + mm_count) > 0 else None,
         output_tokens=output,
         peak_context_tokens=peak_context_tokens or None,
         summarization_count=summarization_count,
-        aiu=_nano_aiu_to_aiu(nano_aiu or checkpoint_nano_aiu),
+        aiu=_nano_aiu_to_aiu(
+            nano_aiu_sum if shutdown_nano_aiu_values else checkpoint_nano_aiu
+        ),
         premium_requests=(
             shutdown_premium_requests
             if has_premium_requests
             else reported_premium_requests
         ),
+        token_accounting_source=shutdown_source,
+        mm_input_tokens=mm_input,
+        mm_cache_read_tokens=mm_cache_read,
+        mm_cache_write_tokens=mm_cache_write,
+        mm_output_tokens=mm_output,
     )
 
 
 def _nano_aiu_to_aiu(nano_aiu: float | None) -> float | None:
-    return round(nano_aiu / 1_000_000_000, 6) if nano_aiu else None
+    """Convert raw nanoAiu to AI credits (totalNanoAiu / 1e9).
+
+    A genuine zero nanoAiu session (0.0) returns 0.0, not None. Only a
+    missing value (None) propagates as None.
+    """
+    if nano_aiu is None:
+        return None
+    return round(nano_aiu / 1_000_000_000, 6)
 
 
 def _shutdown_token_details_usage(
@@ -2278,3 +2459,14 @@ def _max_optional(left: int | None, right: int | None) -> int | None:
 
 def _string_or_none(value: Any) -> str | None:
     return str(value) if value is not None else None
+
+
+def _copy_extra_keys_to_metadata(
+    extra: dict[str, Any],
+    metadata: dict[str, Any],
+    keys: tuple[str, ...],
+) -> None:
+    """Copy the listed keys from *extra* into *metadata* when present."""
+    for key in keys:
+        if key in extra:
+            metadata[key] = extra[key]

@@ -41,11 +41,28 @@ def test_copilot_cli_converts_native_events_to_atif(tmp_path: Path):
     assert trajectory.final_metrics.total_prompt_tokens == 100
     assert trajectory.final_metrics.total_cached_tokens == 20
     assert trajectory.final_metrics.total_completion_tokens == 5
-    assert trajectory.final_metrics.extra == {
-        "copilot_aiu": 0.25,
-        "peak_context_tokens": 2000,
-        "summarization_count": 1,
-    }
+    # Cost derived from AIU × public-list rate (Task A)
+    assert trajectory.final_metrics.total_cost_usd == pytest.approx(0.0025)
+    extra = trajectory.final_metrics.extra
+    assert extra is not None
+    # Existing keys preserved
+    assert extra["copilot_aiu"] == 0.25
+    assert extra["peak_context_tokens"] == 2000
+    assert extra["summarization_count"] == 1
+    # Task A: cost provenance
+    assert extra["copilot_cost_rate_usd_per_credit"] == 0.01
+    assert extra["copilot_cost_basis"] == "github-public-ai-credit-list-price"
+    assert "copilot_cost_source" in extra
+    assert extra["copilot_cost_as_of"] == "2026-08-26"
+    # Task B: model provenance — session.start.selectedModel = "gpt-5.4"
+    assert extra["copilot_observed_models"] == ["gpt-5.4"]
+    assert extra["copilot_model_provenance_source"] == "session_events"
+    # No copilot_requested_model because requested == observed
+    assert "copilot_requested_model" not in extra
+    # Task C: token accounting provenance — modelMetrics source, cache-inclusive input
+    assert extra["token_accounting_source"] == "modelMetrics"
+    assert extra["input_includes_cache"] is True
+    assert extra["cache_write_tokens"] == 10
 
 
 def test_copilot_cli_shutdown_metrics_aggregate_models_without_token_details(

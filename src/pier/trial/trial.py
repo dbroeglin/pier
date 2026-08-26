@@ -44,6 +44,7 @@ from pier.models.trial.config import (
 from pier.models.trial.paths import TrialPaths
 from pier.models.trial.result import (
     ExceptionInfo,
+    ModelInfo,
     StepResult,
     TimingInfo,
     TrialResult,
@@ -602,6 +603,22 @@ class Trial:
                 trajectory_path
             )
         _mirror_overlay_to_metadata(agent_result, self.config.context_overlay_id)
+        # Refresh agent_info.model_info from post-run observed model evidence (Task B).
+        # populate_context_post_run stores copilot_observed_models in metadata when
+        # native session events carry explicit model identifiers. The first entry is the
+        # root model the server selected; provider is left None (not inferred).
+        if self._result is not None:
+            metadata = agent_result.metadata or {}
+            observed = metadata.get("copilot_observed_models")
+            if (
+                isinstance(observed, list)
+                and observed
+                and isinstance(observed[0], str)
+                and observed[0]
+            ):
+                self._result.agent_info.model_info = ModelInfo(
+                    name=observed[0], provider=None
+                )
 
     def _create_step_dirs(self, step_name: str) -> tuple[Path, Path]:
         """Create and return (agent_dir, verifier_dir) for a step."""
