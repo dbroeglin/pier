@@ -100,8 +100,14 @@ def _trial_result(config: TrialConfig, task_dir: Path) -> TrialResult:
 class _StubCopilotAgent(BaseInstalledAgent):
     """Minimal CopilotCli-like agent that populates metadata with model info."""
 
-    def __init__(self, logs_dir: Path, *, observed_models: list[str] | None = None):
-        super().__init__(logs_dir=logs_dir)
+    def __init__(
+        self,
+        logs_dir: Path,
+        *,
+        model_name: str | None = None,
+        observed_models: list[str] | None = None,
+    ):
+        super().__init__(logs_dir=logs_dir, model_name=model_name)
         self._observed_models = observed_models or []
 
     @staticmethod
@@ -1019,3 +1025,88 @@ def test_copilot_aiu_key_preserved_for_backward_compat(tmp_path: Path) -> None:
     assert trajectory is not None
     extra = trajectory.final_metrics.extra or {}
     assert extra["copilot_aiu"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# B. Provider preservation — focused Fact-Checker boundary tests
+# ---------------------------------------------------------------------------
+
+
+def test_model_provider_preserved_when_observed_matches_configured_bare_name(
+    tmp_path: Path,
+) -> None:
+    """requested 'github/claude-sonnet-5', observed 'claude-sonnet-5' → provider='github'."""
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    stub_agent = _StubCopilotAgent(
+        tmp_path,
+        model_name="github/claude-sonnet-5",
+        observed_models=["claude-sonnet-5"],
+    )
+    # Simulate what Trial.run() does after _setup_agent(): record configured model info.
+    result.agent_info = stub_agent.to_agent_info()
+    trial = _fake_trial(tmp_path, result=result, agent=stub_agent)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    assert result.agent_info.model_info is not None
+    assert result.agent_info.model_info.name == "claude-sonnet-5"
+    # Explicit provider from 'github/claude-sonnet-5' spec is preserved
+    assert result.agent_info.model_info.provider == "github"
+    # CLI version must not be touched
+    assert result.agent_info.version == "1.0.80"
+
+
+def test_model_provider_not_transferred_when_observed_differs_from_configured(
+    tmp_path: Path,
+) -> None:
+    """requested 'github/gpt-5.4', observed 'claude-sonnet-5' → provider=None, mismatch retained."""
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    stub_agent = _StubCopilotAgent(
+        tmp_path,
+        model_name="github/gpt-5.4",
+        observed_models=["claude-sonnet-5"],  # server selected a different model
+    )
+    # Simulate to_agent_info() → model_info.name="gpt-5.4", provider="github"
+    result.agent_info = stub_agent.to_agent_info()
+    trial = _fake_trial(tmp_path, result=result, agent=stub_agent)
+
+    # Simulate metadata already populated (is_empty=False to skip populate_context_post_run)
+    agent_result = AgentContext(
+        metadata={
+            "copilot_observed_models": ["claude-sonnet-5"],
+            "copilot_requested_model": "gpt-5.4",  # mismatch marker from task B
+        }
+    )
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    assert result.agent_info.model_info is not None
+    assert result.agent_info.model_info.name == "claude-sonnet-5"
+    # 'github' provider from 'gpt-5.4' spec must NOT be applied to a different model
+    assert result.agent_info.model_info.provider is None
+    # Mismatch metadata preserved unchanged
+    assert (agent_result.metadata or {})["copilot_requested_model"] == "gpt-5.4"
+
+
+def test_model_provider_is_none_without_provider_prefix_in_configured_spec(
+    tmp_path: Path,
+) -> None:
+    """No requested provider → provider=None, even when observed name matches configured."""
+    config = _trial_config(tmp_path)
+    result = _trial_result(config, tmp_path)
+    stub_agent = _StubCopilotAgent(
+        tmp_path,
+        model_name="claude-sonnet-5",  # no 'provider/' prefix
+        observed_models=["claude-sonnet-5"],
+    )
+    result.agent_info = stub_agent.to_agent_info()
+    trial = _fake_trial(tmp_path, result=result, agent=stub_agent)
+
+    agent_result = AgentContext()
+    Trial._maybe_populate_agent_context(trial, agent_result)
+
+    assert result.agent_info.model_info is not None
+    assert result.agent_info.model_info.name == "claude-sonnet-5"
+    assert result.agent_info.model_info.provider is None

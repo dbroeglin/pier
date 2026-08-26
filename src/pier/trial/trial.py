@@ -606,7 +606,16 @@ class Trial:
         # Refresh agent_info.model_info from post-run observed model evidence (Task B).
         # populate_context_post_run stores copilot_observed_models in metadata when
         # native session events carry explicit model identifiers. The first entry is the
-        # root model the server selected; provider is left None (not inferred).
+        # root model the server selected.
+        #
+        # Provider preservation: to_agent_info() runs before this method and records
+        # the configured provider/model spec (e.g. "github/claude-sonnet-5" →
+        # provider="github", name="claude-sonnet-5") in agent_info.model_info. When the
+        # observed model name matches the pre-run parsed name exactly, the explicitly
+        # configured provider is preserved rather than overwritten with None. When the
+        # observed model differs (server selected a different model), provider is set to
+        # None because the old provider cannot safely be applied to a different model.
+        # Provider is never inferred from scratch.
         if self._result is not None:
             metadata = agent_result.metadata or {}
             observed = metadata.get("copilot_observed_models")
@@ -616,8 +625,14 @@ class Trial:
                 and isinstance(observed[0], str)
                 and observed[0]
             ):
+                existing = self._result.agent_info.model_info
+                provider: str | None = (
+                    existing.provider
+                    if existing is not None and existing.name == observed[0]
+                    else None
+                )
                 self._result.agent_info.model_info = ModelInfo(
-                    name=observed[0], provider=None
+                    name=observed[0], provider=provider
                 )
 
     def _create_step_dirs(self, step_name: str) -> tuple[Path, Path]:
