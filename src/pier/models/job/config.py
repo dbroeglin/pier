@@ -214,11 +214,22 @@ class RetryConfig(BaseModel):
 class JobConfig(BaseModel):
     # If replay-affecting fields are added or changed here, update JobLock in
     # pier.models.job.lock so lock.json records the same resolved run input.
+    # context_overlay_id propagates to every TrialConfig and is recorded in
+    # each TrialLock; no separate JobLock top-level field is needed.
     job_name: str = Field(
         default_factory=lambda: datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
     )
     jobs_dir: Path = Path("jobs")
     n_attempts: int = 1
+    context_overlay_id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque experiment identifier (e.g. 'baseline-v1') propagated to every "
+            "generated TrialConfig and recorded in each TrialLock. None means not "
+            "recorded. Values are opaque versioned slugs; no mechanism-specific "
+            "validation is applied."
+        ),
+    )
     timeout_multiplier: float = 1.0
     agent_timeout_multiplier: float | None = None
     verifier_timeout_multiplier: float | None = None

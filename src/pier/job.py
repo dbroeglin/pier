@@ -330,6 +330,7 @@ class Job:
                 verifier=self.config.verifier,
                 artifacts=self.config.artifacts,
                 job_id=self._id,
+                context_overlay_id=self.config.context_overlay_id,
             )
             for _ in range(self.config.n_attempts)
             for task_config in self._task_configs
