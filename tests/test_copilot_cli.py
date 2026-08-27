@@ -861,3 +861,97 @@ def test_cli_flag_quoting_applies_inside_a_format_template(tmp_path: Path) -> No
 
     assert "--templated='a b; rm -rf /'" in flags
     assert "--plain=safe" in flags
+
+
+# ---------------------------------------------------------------------------
+# BYOK / Azure AI Foundry opt-in egress tests
+# ---------------------------------------------------------------------------
+
+
+def test_copilot_cli_default_allowlist_excludes_foundry_domain(tmp_path: Path) -> None:
+    """Standard Copilot runs must not reach Azure Foundry by default."""
+    agent = CopilotCli(logs_dir=tmp_path)
+    domains = set(agent.network_allowlist().domains)
+
+    assert ".services.ai.azure.com" not in domains
+    assert "services.ai.azure.com" not in domains
+
+
+def test_copilot_cli_byok_foundry_base_url_adds_azure_foundry_domain(
+    tmp_path: Path,
+) -> None:
+    """COPILOT_PROVIDER_BASE_URL targeting *.services.ai.azure.com opts in to Foundry egress."""
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            "COPILOT_PROVIDER_BASE_URL": (
+                "https://my-deployment.services.ai.azure.com/models/v1/"
+            ),
+            "COPILOT_PROVIDER_TYPE": "openai-compatible",
+            "COPILOT_MODEL": "MAI-Thinking-1",
+        },
+    )
+    domains = set(agent.network_allowlist().domains)
+
+    # Foundry suffix is added
+    assert ".services.ai.azure.com" in domains
+    # Standard GitHub domains are preserved
+    assert {".github.com", ".githubcopilot.com", ".githubusercontent.com", "gh.io"} <= domains
+
+
+def test_copilot_cli_byok_arbitrary_url_does_not_expand_allowlist(
+    tmp_path: Path,
+) -> None:
+    """A COPILOT_PROVIDER_BASE_URL outside services.ai.azure.com must not widen egress."""
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            "COPILOT_PROVIDER_BASE_URL": "https://custom.example.com/v1/",
+        },
+    )
+    domains = set(agent.network_allowlist().domains)
+
+    assert ".services.ai.azure.com" not in domains
+    assert "custom.example.com" not in domains
+
+
+def test_copilot_cli_byok_env_vars_reach_process_env(tmp_path: Path) -> None:
+    """BYOK env-var *names* must survive build_process_env without being stripped.
+
+    COPILOT_PROVIDER_API_KEY is a placeholder here — values are never committed.
+    """
+    byok_names = {
+        "COPILOT_PROVIDER_TYPE": "openai-compatible",
+        "COPILOT_PROVIDER_BASE_URL": (
+            "https://my-deployment.services.ai.azure.com/models/v1/"
+        ),
+        "COPILOT_PROVIDER_API_KEY": "PLACEHOLDER_NOT_A_REAL_KEY",
+        "COPILOT_MODEL": "MAI-Thinking-1",
+        "COPILOT_PROVIDER_WIRE_API": "openai",
+    }
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            **byok_names,
+        },
+    )
+    process_env = agent.build_process_env({"COPILOT_GITHUB_TOKEN": "gh-placeholder"})
+
+    for name in byok_names:
+        assert name in process_env, f"BYOK env var {name!r} was stripped from process env"
+
+
+def test_copilot_cli_byok_provider_api_key_is_not_stripped(tmp_path: Path) -> None:
+    """COPILOT_PROVIDER_API_KEY must not be dropped like COPILOT_HOME or empty token."""
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            "COPILOT_PROVIDER_API_KEY": "PLACEHOLDER_NOT_A_REAL_KEY",
+        },
+    )
+
+    assert "COPILOT_PROVIDER_API_KEY" in agent._extra_env

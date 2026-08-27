@@ -30,6 +30,7 @@ from pier.agents.installed.copilot_cli import (
     _GITHUB_AI_CREDIT_RATE_BASIS,
     _GITHUB_AI_CREDIT_RATE_SOURCE,
     _GITHUB_AI_CREDIT_RATE_USD,
+    _is_azure_foundry_url,
     _nano_aiu_to_aiu,
 )
 from pier.agents.installed.base import BaseInstalledAgent
@@ -1110,3 +1111,112 @@ def test_model_provider_is_none_without_provider_prefix_in_configured_spec(
     assert result.agent_info.model_info is not None
     assert result.agent_info.model_info.name == "claude-sonnet-5"
     assert result.agent_info.model_info.provider is None
+
+
+# ---------------------------------------------------------------------------
+# BYOK billing provenance and _is_azure_foundry_url unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_azure_foundry_url_accepts_subdomain() -> None:
+    assert _is_azure_foundry_url(
+        "https://my-deployment.services.ai.azure.com/models/v1/"
+    )
+
+
+def test_is_azure_foundry_url_accepts_bare_domain() -> None:
+    assert _is_azure_foundry_url("https://services.ai.azure.com/v1/")
+
+
+def test_is_azure_foundry_url_rejects_arbitrary_host() -> None:
+    assert not _is_azure_foundry_url("https://custom.example.com/v1/")
+
+
+def test_is_azure_foundry_url_rejects_empty_string() -> None:
+    assert not _is_azure_foundry_url("")
+
+
+def test_is_azure_foundry_url_rejects_partial_match() -> None:
+    # Must not match a domain that merely *contains* the string.
+    assert not _is_azure_foundry_url("https://evil.services.ai.azure.com.attacker.io/v1/")
+
+
+def test_byok_trajectory_has_no_github_cost_fields(tmp_path: Path) -> None:
+    """BYOK run: no GitHub AIU → no GitHub cost fields, byok_cost_basis present."""
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            "COPILOT_PROVIDER_BASE_URL": (
+                "https://my-deployment.services.ai.azure.com/models/v1/"
+            ),
+            "COPILOT_PROVIDER_TYPE": "openai-compatible",
+        },
+    )
+    events = [
+        {"type": "user.message", "data": {"content": "Go"}},
+        {"type": "assistant.message", "data": {"messageId": "m1", "content": "Done"}},
+        # No totalNanoAiu — GitHub backend not involved
+        {"type": "session.shutdown", "data": {}},
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    assert trajectory.final_metrics is not None
+    extra = trajectory.final_metrics.extra or {}
+    # No GitHub cost
+    assert trajectory.final_metrics.total_cost_usd is None
+    assert "copilot_cost_rate_usd_per_credit" not in extra
+    assert "copilot_cost_basis" not in extra
+    # BYOK provenance present (hostname only — no secret)
+    assert extra.get("byok_provider_host") == "my-deployment.services.ai.azure.com"
+    assert extra.get("byok_provider_type") == "openai-compatible"
+    assert extra.get("byok_cost_basis") == "byok-external-provider-no-github-aiu"
+
+
+def test_byok_trajectory_non_secret_fields_only(tmp_path: Path) -> None:
+    """BYOK extra fields must never contain API key values."""
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            "COPILOT_PROVIDER_BASE_URL": (
+                "https://my-deployment.services.ai.azure.com/models/v1/"
+            ),
+            "COPILOT_PROVIDER_API_KEY": "PLACEHOLDER_NOT_A_REAL_KEY",
+        },
+    )
+    events = [
+        {"type": "user.message", "data": {"content": "Go"}},
+        {"type": "assistant.message", "data": {"messageId": "m1", "content": "Done"}},
+        {"type": "session.shutdown", "data": {}},
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    extra = trajectory.final_metrics.extra or {}
+    # The API key value must not leak into the trajectory
+    assert "PLACEHOLDER_NOT_A_REAL_KEY" not in str(extra)
+    assert "COPILOT_PROVIDER_API_KEY" not in extra
+
+
+def test_standard_run_extra_has_no_byok_fields(tmp_path: Path) -> None:
+    """Non-BYOK run must not emit byok_* fields."""
+    agent = _make_agent(tmp_path)
+    events = [
+        {"type": "user.message", "data": {"content": "Go"}},
+        {"type": "assistant.message", "data": {"messageId": "m1", "content": "Done"}},
+        _shutdown_event(nano_aiu=50_000_000),
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    extra = trajectory.final_metrics.extra or {}
+    assert "byok_provider_host" not in extra
+    assert "byok_provider_type" not in extra
+    assert "byok_cost_basis" not in extra
+    # Normal GitHub cost fields are still present
+    assert "copilot_cost_basis" in extra

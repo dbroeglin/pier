@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pier.agents.installed.base import BaseInstalledAgent, CliFlag, with_prompt_template
+from pier.agents.network import hostname_from_url
 from pier.environments.base import BaseEnvironment
 from pier.models.agent.context import AgentContext
 from pier.models.agent.install import AgentInstallSpec, InstallStep
@@ -45,6 +46,31 @@ _GITHUB_AI_CREDIT_RATE_AS_OF: str = "2026-08-26"
 _GITHUB_AI_CREDIT_RATE_SOURCE: str = (
     "https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing"
 )
+
+# Azure AI Foundry BYOK: permitted egress domain for opt-in Foundry experiments.
+# Only *.services.ai.azure.com is whitelisted; arbitrary provider URLs are not.
+_AZURE_FOUNDRY_DOMAIN = "services.ai.azure.com"
+
+# BYOK env-var contract (names only — values arrive in an ignored local file):
+# COPILOT_PROVIDER_TYPE     – provider kind, e.g. "openai-compatible"
+# COPILOT_PROVIDER_BASE_URL – endpoint URL, must resolve under services.ai.azure.com
+# COPILOT_PROVIDER_API_KEY  – secret; never logged, serialised, or committed
+# COPILOT_MODEL             – model identifier sent to the provider
+# COPILOT_PROVIDER_WIRE_API – optional wire-API override
+
+
+def _is_azure_foundry_url(value: str) -> bool:
+    """Return True when *value* is a URL hosted under services.ai.azure.com.
+
+    Used exclusively to gate the opt-in egress allowlist entry; no credentials
+    are read or validated here.
+    """
+    hostname = hostname_from_url(value)
+    if hostname is None:
+        return False
+    return hostname == _AZURE_FOUNDRY_DOMAIN or hostname.endswith(
+        f".{_AZURE_FOUNDRY_DOMAIN}"
+    )
 
 
 @dataclass
@@ -232,14 +258,20 @@ class CopilotCli(BaseInstalledAgent):
 
     def network_allowlist(self) -> NetworkAllowlist:
         # Squid's dstdomain ACL rejects overlapping bare and dotted domains.
-        return NetworkAllowlist(
-            domains=[
-                ".github.com",
-                ".githubcopilot.com",
-                ".githubusercontent.com",
-                "gh.io",
-            ]
-        )
+        domains = [
+            ".github.com",
+            ".githubcopilot.com",
+            ".githubusercontent.com",
+            "gh.io",
+        ]
+        # Opt-in: permit Azure AI Foundry egress only when COPILOT_PROVIDER_BASE_URL
+        # explicitly targets *.services.ai.azure.com.  Arbitrary provider URLs are
+        # intentionally NOT forwarded — only the pinned Foundry suffix is added.
+        # Standard Copilot behavior (no BYOK fields) is unaffected.
+        provider_url = self._extra_env.get("COPILOT_PROVIDER_BASE_URL", "")
+        if _is_azure_foundry_url(provider_url):
+            domains.append(f".{_AZURE_FOUNDRY_DOMAIN}")
+        return NetworkAllowlist(domains=domains)
 
     def install_spec(self) -> AgentInstallSpec:
         version_env = f" VERSION={shlex.quote(self._version)}" if self._version else ""
@@ -486,6 +518,9 @@ class CopilotCli(BaseInstalledAgent):
                     "token_accounting_source",
                     "input_includes_cache",
                     "cache_write_tokens",
+                    "byok_provider_host",
+                    "byok_provider_type",
+                    "byok_cost_basis",
                 ),
             )
         context.metadata = metadata or None
@@ -553,7 +588,25 @@ class CopilotCli(BaseInstalledAgent):
 
         # Task A: Public-list cost provenance — rate, basis, source URL, as-of date.
         # Derived: AI credits × public-list rate = public-list USD equivalent.
+        # BYOK guard: when COPILOT_PROVIDER_BASE_URL points to an external provider,
+        # GitHub AIU is never reported by the CLI (the GitHub backend is not called),
+        # so aiu will be None and no GitHub cost fields will be emitted.  The
+        # byok_provider_host field documents the call destination without logging any
+        # secret value.
         aiu = session_metrics.aiu
+        byok_host = hostname_from_url(
+            self._extra_env.get("COPILOT_PROVIDER_BASE_URL", "")
+        )
+        if byok_host is not None:
+            # Non-secret: hostname only, never the API key or full URL with credentials.
+            extra["byok_provider_host"] = byok_host
+            provider_type = self._extra_env.get("COPILOT_PROVIDER_TYPE")
+            if provider_type:
+                extra["byok_provider_type"] = provider_type
+            # If AIU arrives despite BYOK config (runtime anomaly), mark it explicitly
+            # so downstream does not misattribute the cost to the external provider.
+            if aiu is None:
+                extra["byok_cost_basis"] = "byok-external-provider-no-github-aiu"
         if aiu is not None:
             extra["copilot_cost_rate_usd_per_credit"] = _GITHUB_AI_CREDIT_RATE_USD
             extra["copilot_cost_basis"] = _GITHUB_AI_CREDIT_RATE_BASIS
