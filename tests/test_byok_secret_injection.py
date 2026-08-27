@@ -405,3 +405,153 @@ def test_exec_log_does_not_leak_copilot_provider_api_key(tmp_path: Path):
     )
     # Non-secret provenance vars survive
     assert env_logged.get("COPILOT_PROVIDER_TYPE") == "openai"
+
+
+# ===========================================================================
+# Part 7 (Reviewer gap 1): Full TrialResult.model_dump_json() serialization chain
+# ===========================================================================
+# Tests the end-to-end path: AgentConfig(literal) → TrialConfig → TrialResult
+# → model_dump_json().  Proves that config/result.json written to disk cannot
+# contain the raw bearer-token value even when a literal placeholder is used
+# as the AgentConfig.env value.
+
+
+from pier.models.task.id import LocalTaskId
+from pier.models.trial.config import TaskConfig, TrialConfig
+from pier.models.trial.result import AgentInfo, TrialResult
+
+
+def test_trial_result_json_redacts_literal_byok_api_key(tmp_path: Path, monkeypatch):
+    """TrialResult.model_dump_json() must not contain raw literal API key.
+
+    Full chain: AgentConfig.env (literal placeholder) → TrialConfig → TrialResult
+    → model_dump_json().  The templatize_sensitive_env field_serializer converts
+    the literal to ${COPILOT_PROVIDER_API_KEY} because it matches os.environ.
+    """
+    monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", _PLACEHOLDER_API_KEY)
+
+    agent_config = AgentConfig(
+        name="copilot-cli",
+        env={
+            "COPILOT_PROVIDER_API_KEY": _PLACEHOLDER_API_KEY,  # literal, not template
+            "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_BASE_URL": _PLACEHOLDER_BASE_URL,
+            "COPILOT_MODEL": "MAI-Thinking-1",
+        },
+    )
+    trial_config = TrialConfig(
+        task=TaskConfig(path=tmp_path),
+        agent=agent_config,
+    )
+    trial_result = TrialResult(
+        task_name="gate2b-test-task",
+        trial_name="gate2b-test-trial",
+        trial_uri="test://gate2b",
+        task_id=LocalTaskId(path=tmp_path),
+        task_checksum="a" * 64,
+        config=trial_config,
+        agent_info=AgentInfo(name="copilot-cli", version="1.0.80"),
+    )
+
+    json_str = trial_result.model_dump_json()
+
+    # Raw literal must not appear anywhere in the persisted JSON
+    assert _PLACEHOLDER_API_KEY not in json_str, (
+        "Raw COPILOT_PROVIDER_API_KEY literal leaked into TrialResult JSON"
+    )
+    # Non-secret BYOK vars must remain readable (they are not redacted)
+    assert "openai" in json_str
+    assert _PLACEHOLDER_BASE_URL in json_str
+    assert "MAI-Thinking-1" in json_str
+    # Confirm the safe representation is present (template or redacted form)
+    import json
+    parsed = json.loads(json_str)
+    api_key_repr = parsed["config"]["agent"]["env"]["COPILOT_PROVIDER_API_KEY"]
+    assert _PLACEHOLDER_API_KEY not in api_key_repr
+    assert api_key_repr  # non-empty safe placeholder
+
+
+# ===========================================================================
+# Part 8 (Reviewer gap 2): Failed-agent exception/result JSON path with BYOK
+# ===========================================================================
+# Tests that NonZeroAgentExitCodeError — the realistic exception raised by
+# _exec() when the agent subprocess fails — cannot carry BYOK credential
+# values in its message or traceback, and that ExceptionInfo embedded in
+# a TrialResult serializes safely.
+
+
+from pier.agents.installed.base import NonZeroAgentExitCodeError
+from pier.models.trial.result import ExceptionInfo
+
+
+def test_non_zero_exit_exception_message_does_not_contain_byok_value():
+    """NonZeroAgentExitCodeError message format never includes env-var values.
+
+    The realistic _exec() exception message format is:
+        "Command failed (exit {code}): {command}\\nstdout: ...\\nstderr: ..."
+    where {command} is the shell script string, not the env dict.
+    """
+    try:
+        raise NonZeroAgentExitCodeError(
+            f"Command failed (exit 1): copilot -p 'fix it' --model MAI-Thinking-1\n"
+            f"stdout: error: could not reach copilot service\n"
+            f"stderr: "
+        )
+    except NonZeroAgentExitCodeError as exc:
+        info = ExceptionInfo.from_exception(exc)
+
+    # Neither the exception message nor the traceback contains the BYOK value
+    assert _PLACEHOLDER_API_KEY not in info.exception_message
+    assert _PLACEHOLDER_API_KEY not in info.exception_traceback
+    # Type is faithfully recorded (non-sensitive diagnostic)
+    assert info.exception_type == "NonZeroAgentExitCodeError"
+
+
+def test_trial_result_with_byok_and_exception_info_does_not_leak(
+    tmp_path: Path, monkeypatch
+):
+    """TrialResult.model_dump_json() with exception_info + BYOK config: no secret leak.
+
+    Combines both Reviewer gaps: the full result.json serialization (Gap 1)
+    in a failed-trial scenario where exception_info is also populated (Gap 2).
+    """
+    monkeypatch.setenv("COPILOT_PROVIDER_API_KEY", _PLACEHOLDER_API_KEY)
+
+    # Build ExceptionInfo from the realistic exception class
+    try:
+        raise NonZeroAgentExitCodeError(
+            f"Command failed (exit 1): copilot -p 'fix the code' --model MAI-Thinking-1\n"
+            f"stdout: connection refused\n"
+            f"stderr: "
+        )
+    except NonZeroAgentExitCodeError as exc:
+        exc_info = ExceptionInfo.from_exception(exc)
+
+    agent_config = AgentConfig(
+        name="copilot-cli",
+        env={
+            "COPILOT_PROVIDER_API_KEY": _PLACEHOLDER_API_KEY,
+            "COPILOT_PROVIDER_TYPE": "openai",
+            "COPILOT_PROVIDER_BASE_URL": _PLACEHOLDER_BASE_URL,
+        },
+    )
+    trial_result = TrialResult(
+        task_name="gate2b-exc-test",
+        trial_name="gate2b-exc-trial",
+        trial_uri="test://gate2b-exc",
+        task_id=LocalTaskId(path=tmp_path),
+        task_checksum="b" * 64,
+        config=TrialConfig(task=TaskConfig(path=tmp_path), agent=agent_config),
+        agent_info=AgentInfo(name="copilot-cli", version="1.0.80"),
+        exception_info=exc_info,
+    )
+
+    json_str = trial_result.model_dump_json()
+
+    # The placeholder API key must not appear anywhere in the persisted JSON
+    assert _PLACEHOLDER_API_KEY not in json_str, (
+        "COPILOT_PROVIDER_API_KEY leaked into TrialResult JSON with exception_info"
+    )
+    # Exception metadata is still present (diagnostic value preserved)
+    assert "NonZeroAgentExitCodeError" in json_str
+    assert "exception_message" in json_str
