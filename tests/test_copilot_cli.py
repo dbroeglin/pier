@@ -888,7 +888,7 @@ def test_copilot_cli_byok_foundry_base_url_adds_azure_foundry_domain(
             "COPILOT_PROVIDER_BASE_URL": (
                 "https://my-deployment.services.ai.azure.com/models/v1/"
             ),
-            "COPILOT_PROVIDER_TYPE": "openai-compatible",
+            "COPILOT_PROVIDER_TYPE": "openai",
             "COPILOT_MODEL": "MAI-Thinking-1",
         },
     )
@@ -923,7 +923,7 @@ def test_copilot_cli_byok_env_vars_reach_process_env(tmp_path: Path) -> None:
     COPILOT_PROVIDER_API_KEY is a placeholder here — values are never committed.
     """
     byok_names = {
-        "COPILOT_PROVIDER_TYPE": "openai-compatible",
+        "COPILOT_PROVIDER_TYPE": "openai",
         "COPILOT_PROVIDER_BASE_URL": (
             "https://my-deployment.services.ai.azure.com/models/v1/"
         ),
