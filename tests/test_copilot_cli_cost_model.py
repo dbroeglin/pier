@@ -1141,6 +1141,35 @@ def test_is_azure_foundry_url_rejects_partial_match() -> None:
     assert not _is_azure_foundry_url("https://evil.services.ai.azure.com.attacker.io/v1/")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Non-HTTPS schemes must be rejected
+        "http://my-deployment.services.ai.azure.com/models/v1/",
+        "ws://my-deployment.services.ai.azure.com/models/v1/",
+        "wss://my-deployment.services.ai.azure.com/models/v1/",
+        "ftp://my-deployment.services.ai.azure.com/files/",
+        # javascript: has no "://" in the right position
+        "javascript:alert(1)",
+        # Userinfo (host-confusion) — trusted hostname as credential, real host differs
+        "https://services.ai.azure.com@evil.com/v1/",
+        # Userinfo present even on the real domain — reject to prevent credential exposure
+        "https://user:pass@my-deployment.services.ai.azure.com/v1/",
+        "https://user@my-deployment.services.ai.azure.com/v1/",
+        # Bare hostname without scheme
+        "my-deployment.services.ai.azure.com",
+        # Off-domain with partial string match
+        "https://evil.services.ai.azure.com.attacker.io/v1/",
+        # Empty / malformed
+        "",
+        "not-a-url",
+        "://missing-scheme.services.ai.azure.com/",
+    ],
+)
+def test_is_azure_foundry_url_rejects_invalid(url: str) -> None:
+    assert not _is_azure_foundry_url(url)
+
+
 def test_byok_trajectory_has_no_github_cost_fields(tmp_path: Path) -> None:
     """BYOK run: no GitHub AIU → no GitHub cost fields, byok_cost_basis present."""
     agent = CopilotCli(
@@ -1150,7 +1179,7 @@ def test_byok_trajectory_has_no_github_cost_fields(tmp_path: Path) -> None:
             "COPILOT_PROVIDER_BASE_URL": (
                 "https://my-deployment.services.ai.azure.com/models/v1/"
             ),
-            "COPILOT_PROVIDER_TYPE": "openai-compatible",
+            "COPILOT_PROVIDER_TYPE": "openai",
         },
     )
     events = [
@@ -1171,7 +1200,7 @@ def test_byok_trajectory_has_no_github_cost_fields(tmp_path: Path) -> None:
     assert "copilot_cost_basis" not in extra
     # BYOK provenance present (hostname only — no secret)
     assert extra.get("byok_provider_host") == "my-deployment.services.ai.azure.com"
-    assert extra.get("byok_provider_type") == "openai-compatible"
+    assert extra.get("byok_provider_type") == "openai"
     assert extra.get("byok_cost_basis") == "byok-external-provider-no-github-aiu"
 
 
@@ -1220,3 +1249,38 @@ def test_standard_run_extra_has_no_byok_fields(tmp_path: Path) -> None:
     assert "byok_cost_basis" not in extra
     # Normal GitHub cost fields are still present
     assert "copilot_cost_basis" in extra
+
+
+def test_byok_aiu_anomaly_marked_when_github_aiu_present_despite_byok(
+    tmp_path: Path,
+) -> None:
+    """BYOK configured + unexpected totalNanoAiu → anomaly marker set, GitHub cost still emitted."""
+    agent = CopilotCli(
+        logs_dir=tmp_path,
+        extra_env={
+            "COPILOT_GITHUB_TOKEN": "gh-placeholder",
+            "COPILOT_PROVIDER_BASE_URL": (
+                "https://my-deployment.services.ai.azure.com/models/v1/"
+            ),
+            "COPILOT_PROVIDER_TYPE": "openai",
+        },
+    )
+    events = [
+        {"type": "user.message", "data": {"content": "Go"}},
+        {"type": "assistant.message", "data": {"messageId": "m1", "content": "Done"}},
+        # GitHub AIU unexpectedly present alongside BYOK config — billing anomaly
+        _shutdown_event(nano_aiu=1_000_000_000),
+    ]
+
+    trajectory = agent._convert_events_to_trajectory(events)
+
+    assert trajectory is not None
+    extra = trajectory.final_metrics.extra or {}
+    # BYOK provenance fields present
+    assert extra.get("byok_provider_host") == "my-deployment.services.ai.azure.com"
+    # Anomaly marker set (not the normal BYOK no-aiu marker)
+    assert extra.get("byok_cost_basis") == "byok-foundry-anomaly-unexpected-github-aiu"
+    assert extra.get("byok_cost_basis") != "byok-external-provider-no-github-aiu"
+    # GitHub AIU fields also present (the anomaly does not suppress them)
+    assert extra.get("copilot_aiu") == 1.0
+    assert extra.get("copilot_cost_basis") == _GITHUB_AI_CREDIT_RATE_BASIS

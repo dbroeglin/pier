@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pier.agents.installed.base import BaseInstalledAgent, CliFlag, with_prompt_template
 from pier.agents.network import hostname_from_url
@@ -52,7 +53,7 @@ _GITHUB_AI_CREDIT_RATE_SOURCE: str = (
 _AZURE_FOUNDRY_DOMAIN = "services.ai.azure.com"
 
 # BYOK env-var contract (names only — values arrive in an ignored local file):
-# COPILOT_PROVIDER_TYPE     – provider kind, e.g. "openai-compatible"
+# COPILOT_PROVIDER_TYPE     – provider kind; official value is "openai"
 # COPILOT_PROVIDER_BASE_URL – endpoint URL, must resolve under services.ai.azure.com
 # COPILOT_PROVIDER_API_KEY  – secret; never logged, serialised, or committed
 # COPILOT_MODEL             – model identifier sent to the provider
@@ -60,14 +61,30 @@ _AZURE_FOUNDRY_DOMAIN = "services.ai.azure.com"
 
 
 def _is_azure_foundry_url(value: str) -> bool:
-    """Return True when *value* is a URL hosted under services.ai.azure.com.
+    """Return True when *value* is a valid HTTPS URL under services.ai.azure.com.
 
     Used exclusively to gate the opt-in egress allowlist entry; no credentials
     are read or validated here.
+
+    Requirements:
+    - Scheme must be exactly ``https`` — http, ws, ftp, javascript, and all other
+      schemes are rejected to prevent egress widening over untrusted transports.
+    - No userinfo component (``user@host`` or ``user:pass@host``) — prevents
+      host-confusion attacks where a trusted hostname appears as a credential.
+    - Hostname must equal or be a subdomain of *_AZURE_FOUNDRY_DOMAIN*; arbitrary
+      or user-controlled domains are never permitted.
     """
-    hostname = hostname_from_url(value)
-    if hostname is None:
+    if not isinstance(value, str) or "://" not in value:
         return False
+    parsed = urlparse(value)
+    if parsed.scheme != "https":
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    hostname = hostname.lower().rstrip(".")
     return hostname == _AZURE_FOUNDRY_DOMAIN or hostname.endswith(
         f".{_AZURE_FOUNDRY_DOMAIN}"
     )
@@ -603,9 +620,13 @@ class CopilotCli(BaseInstalledAgent):
             provider_type = self._extra_env.get("COPILOT_PROVIDER_TYPE")
             if provider_type:
                 extra["byok_provider_type"] = provider_type
-            # If AIU arrives despite BYOK config (runtime anomaly), mark it explicitly
-            # so downstream does not misattribute the cost to the external provider.
-            if aiu is None:
+            # When BYOK is configured, GitHub AIU should not be reported (the GitHub
+            # backend is not called).  If totalNanoAiu is present despite BYOK config,
+            # that is a billing anomaly — mark it explicitly so downstream does not
+            # misattribute the cost to the external provider.
+            if aiu is not None:
+                extra["byok_cost_basis"] = "byok-foundry-anomaly-unexpected-github-aiu"
+            else:
                 extra["byok_cost_basis"] = "byok-external-provider-no-github-aiu"
         if aiu is not None:
             extra["copilot_cost_rate_usd_per_credit"] = _GITHUB_AI_CREDIT_RATE_USD
